@@ -1,0 +1,18 @@
+# Compiled Java Class Files
+/target/
+*.class
+
+# Eclipse metadata files
+.mtj.tmp/
+.metadata/
+.classpath
+.project
+.settings/
+*.launch
+*.factorypath
+
+# Log files
+*.log
+
+# Hardcoded environment configuration overrides
+/src/main/resources/application-local.properties
