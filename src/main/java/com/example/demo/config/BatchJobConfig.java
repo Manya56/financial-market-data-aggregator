@@ -18,25 +18,24 @@ import org.springframework.batch.item.support.ListItemReader;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.web.client.RestClientException;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 
 @Configuration
 public class BatchJobConfig {
 
-    // Update the Job to execute BOTH steps sequentially!
     @Bean
     public Job financialIngestionJob(JobRepository jobRepository, Step exchangeRateStep, Step alphaVantageStep) {
         return new JobBuilder("financialIngestionJob", jobRepository)
                 .start(exchangeRateStep)
-                .next(alphaVantageStep) // Chains the stock processing step right after currency
+                .next(alphaVantageStep)
                 .build();
     }
 
-    // --- STEP 1: EXCHANGE RATE REGION ---
+    // --- UPGRADED STEP 1: FAULT-TOLERANT EXCHANGE RATE STEP ---
     @Bean
     public Step exchangeRateStep(JobRepository jobRepository, PlatformTransactionManager transactionManager,
                                 ItemReader<Map.Entry<String, BigDecimal>> exchangeRateReader,
@@ -47,19 +46,29 @@ public class BatchJobConfig {
                 .reader(exchangeRateReader)
                 .processor(exchangeRateProcessor)
                 .writer(financialItemWriter)
+                .faultTolerant() // 🛡️ Enables fault tolerance capabilities
+                .skip(NullPointerException.class) // Skip row if individual values are cleanly broken
+                .skipLimit(10) // Allow up to 10 broken data elements before stopping the step
+                .retry(RestClientException.class) // Retry network timeouts
+                .retryLimit(3) // Try reconnecting up to 3 times automatically
                 .build();
     }
 
     @Bean
     public ListItemReader<Map.Entry<String, BigDecimal>> exchangeRateReader(FinancialApiClient apiClient) {
-    	String apiKey = System.getenv("EXCHANGE_RATE_KEY"); 
+        String apiKey = System.getenv("9e346792516074e01762c31b");
+        if (apiKey == null || apiKey.isBlank()) {
+            System.err.println("⚠️ Warning: EXCHANGE_RATE_KEY environment variable is missing!");
+            return new ListItemReader<>(new ArrayList<>());
+        }
+
         try {
             ExchangeRateResponseDto response = apiClient.fetchExchangeRates(apiKey);
             if (response != null && response.conversionRates() != null) {
                 return new ListItemReader<>(new ArrayList<>(response.conversionRates().entrySet()));
             }
         } catch (Exception e) {
-            System.err.println("ExchangeRate Ingestion failed: " + e.getMessage());
+            System.err.println("ExchangeRate Ingestion failed natively: " + e.getMessage());
         }
         return new ListItemReader<>(new ArrayList<>());
     }
@@ -70,7 +79,7 @@ public class BatchJobConfig {
                 mapper.toEntityFromExchangeRate(entry.getValue(), entry.getKey());
     }
 
-    // --- STEP 2: ALPHA VANTAGE REGION ---
+    // --- UPGRADED STEP 2: FAULT-TOLERANT ALPHA VANTAGE STEP ---
     @Bean
     public Step alphaVantageStep(JobRepository jobRepository, PlatformTransactionManager transactionManager,
                                 ItemReader<Map.Entry<String, AlphaVantageResponseDto.StockData>> alphaVantageReader,
@@ -81,19 +90,29 @@ public class BatchJobConfig {
                 .reader(alphaVantageReader)
                 .processor(alphaVantageProcessor)
                 .writer(financialItemWriter)
+                .faultTolerant() // 🛡️ Enables fault tolerance capabilities
+                .skip(IllegalArgumentException.class) // Skip item if date format or numbers are corrupt
+                .skipLimit(5) // Don't let a few weird payload dates ruin the entire stock history run
+                .retry(RestClientException.class) // Retry on standard API network connection Drops
+                .retryLimit(3)
                 .build();
     }
 
     @Bean
     public ListItemReader<Map.Entry<String, AlphaVantageResponseDto.StockData>> alphaVantageReader(FinancialApiClient apiClient) {
-    	String apiKey = System.getenv("ALPHA_VANTAGE_KEY"); 
+        String apiKey = System.getenv("9e346792516074e01762c31b"); 
+        if (apiKey == null || apiKey.isBlank()) {
+            System.err.println("⚠️ Warning: ALPHA_VANTAGE_KEY environment variable is missing!");
+            return new ListItemReader<>(new ArrayList<>());
+        }
+
         try {
             AlphaVantageResponseDto response = apiClient.fetchStockData("IBM", apiKey);
             if (response != null && response.timeSeries() != null) {
                 return new ListItemReader<>(new ArrayList<>(response.timeSeries().entrySet()));
             }
         } catch (Exception e) {
-            System.err.println("AlphaVantage Ingestion failed: " + e.getMessage());
+            System.err.println("AlphaVantage Ingestion failed natively: " + e.getMessage());
         }
         return new ListItemReader<>(new ArrayList<>());
     }
@@ -102,14 +121,12 @@ public class BatchJobConfig {
     public ItemProcessor<Map.Entry<String, AlphaVantageResponseDto.StockData>, FinancialMarketData> alphaVantageProcessor(FinancialDataMapper mapper) {
         return entry -> {
             if (entry.getValue() == null || entry.getValue().closePrice() == null) {
-                return null; // Skip empty rows
+                return null;
             }
-            // Pass the data object, stock symbol, and the date key to the mapper
             return mapper.toEntityFromAlphaVantage(entry.getValue(), "IBM", entry.getKey());
         };
     }
 
-    // Unified Writer that writes data in fast database batches
     @Bean
     public ItemWriter<FinancialMarketData> financialItemWriter(FinancialMarketDataRepository repository) {
         return chunk -> repository.saveAll(chunk.getItems());
